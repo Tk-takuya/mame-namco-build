@@ -65,9 +65,11 @@ jobs:
             OPTIMIZE=1 \
             2>&1 | tee ../BUILD.log
 
-          BINARY="$(find . -maxdepth 3 -type f -perm -u+x \( -name namcoquattro -o -name mame \) -print -quit)"
+          BINARY="$(find . -maxdepth 3 -type f -perm -u+x \( -name namcoquattrod -o -name namcoquattro -o -name mame \) -print -quit)"
           if [ -z "$BINARY" ]; then
             echo "MAME executable was not found."
+            echo "Executable candidates:"
+            find . -maxdepth 3 -type f -perm -u+x -print
             exit 1
           fi
 
