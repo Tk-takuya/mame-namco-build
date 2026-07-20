@@ -1,0 +1,337 @@
+name: Build integrated VGMPlay and libvgm
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-vgmplay-libvgm.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Linux x86_64 analysis bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      VGMPLAY_COMMIT: 2a8f3909bcfca4c595ca71c0f762ff495a29e130
+      LIBVGM_COMMIT: 9f376fbca88db3e9fd169a8b145b7d6932a020a9
+
+    steps:
+      - name: Checkout VGMPlay with recorded submodules
+        uses: actions/checkout@v6
+        with:
+          repository: ValleyBell/vgmplay-libvgm
+          ref: ${{ env.VGMPLAY_COMMIT }}
+          path: src/vgmplay
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Record original submodule state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p metadata
+          git -C src/vgmplay submodule status --recursive | tee metadata/VGMPLAY_ORIGINAL_SUBMODULE_STATUS.txt
+
+      - name: Replace libvgm with requested commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf src/vgmplay/libvgm
+
+      - name: Checkout requested libvgm commit
+        uses: actions/checkout@v6
+        with:
+          repository: ValleyBell/libvgm
+          ref: ${{ env.LIBVGM_COMMIT }}
+          path: src/vgmplay/libvgm
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            zlib1g-dev \
+            file \
+            binutils \
+            rsync \
+            zstd
+
+      - name: Record source and build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p metadata logs
+
+          git -C src/vgmplay rev-parse HEAD | tee metadata/VGMPLAY_COMMIT.txt
+          git -C src/vgmplay/libvgm rev-parse HEAD | tee metadata/LIBVGM_COMMIT.txt
+          git -C src/vgmplay/libs/inih rev-parse HEAD | tee metadata/INIH_COMMIT.txt
+          git -C src/vgmplay/libs/wingetopt rev-parse HEAD | tee metadata/WINGETOPT_COMMIT.txt
+
+          git -C src/vgmplay log -1 --format=fuller > metadata/VGMPLAY_COMMIT_DETAIL.txt
+          git -C src/vgmplay/libvgm log -1 --format=fuller > metadata/LIBVGM_COMMIT_DETAIL.txt
+          git -C src/vgmplay/libs/inih log -1 --format=fuller > metadata/INIH_COMMIT_DETAIL.txt
+          git -C src/vgmplay/libs/wingetopt log -1 --format=fuller > metadata/WINGETOPT_COMMIT_DETAIL.txt
+
+          uname -a > metadata/UNAME.txt
+          cat /etc/os-release > metadata/OS_RELEASE.txt
+          gcc --version > metadata/GCC_VERSION.txt
+          g++ --version > metadata/GXX_VERSION.txt
+          cmake --version > metadata/CMAKE_VERSION.txt
+          ninja --version > metadata/NINJA_VERSION.txt
+
+          {
+            echo "VGMPlay=${VGMPLAY_COMMIT}"
+            echo "libvgm=${LIBVGM_COMMIT}"
+            echo "BuildType=RelWithDebInfo"
+            echo "LibraryType=STATIC"
+            echo "AudioDrivers=WaveWriterOnly"
+            echo "MediaControls=OFF"
+            echo "Sanitizers=OFF"
+          } > metadata/BUILD_PARAMETERS.txt
+
+      - name: Configure and build libvgm
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cmake \
+            -S src/vgmplay/libvgm \
+            -B build/libvgm \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX="$PWD/stage" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DLIBRARY_TYPE=STATIC \
+            -DUSE_SANITIZERS=OFF \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_PLAYER=ON \
+            -DBUILD_VGM2WAV=ON \
+            -DAUDIODRV_WAVEWRITE=ON \
+            -DAUDIODRV_ALSA=OFF \
+            -DAUDIODRV_PULSE=OFF \
+            -DAUDIODRV_LIBAO=OFF \
+            -DAUDIODRV_OSS=OFF \
+            -DAUDIODRV_SADA=OFF \
+            2>&1 | tee logs/LIBVGM_CONFIGURE.log
+
+          cmake --build build/libvgm --parallel 2 \
+            2>&1 | tee logs/LIBVGM_BUILD.log
+
+          cmake --install build/libvgm \
+            2>&1 | tee logs/LIBVGM_INSTALL.log
+
+      - name: Configure and build VGMPlay against installed libvgm
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LIBVGM_CONFIG="$({ find "$PWD/stage" -type f \( -name 'libvgmConfig.cmake' -o -name 'libvgm-config.cmake' \) -print -quit; } || true)"
+          if [ -z "$LIBVGM_CONFIG" ]; then
+            echo "Installed libvgm CMake package was not found."
+            find stage -maxdepth 5 -type f -print
+            exit 1
+          fi
+          LIBVGM_CONFIG_DIR="$(dirname "$LIBVGM_CONFIG")"
+          echo "$LIBVGM_CONFIG_DIR" | tee metadata/LIBVGM_CONFIG_DIR.txt
+
+          cmake \
+            -S src/vgmplay \
+            -B build/vgmplay \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX="$PWD/stage" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_PREFIX_PATH="$PWD/stage" \
+            -Dlibvgm_DIR="$LIBVGM_CONFIG_DIR" \
+            -DMEDIA_CONTROLS=OFF \
+            2>&1 | tee logs/VGMPLAY_CONFIGURE.log
+
+          cmake --build build/vgmplay --parallel 2 \
+            2>&1 | tee logs/VGMPLAY_BUILD.log
+
+          cmake --install build/vgmplay \
+            2>&1 | tee logs/VGMPLAY_INSTALL.log
+
+      - name: Validate binaries and C352 support
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -x stage/bin/vgmplay
+          test -x stage/bin/vgm2wav
+          test -x stage/bin/player
+
+          stage/bin/vgmplay --version | tee metadata/VGMPLAY_VERSION.txt
+          stage/bin/vgmplay --help | tee metadata/VGMPLAY_HELP.txt
+          stage/bin/vgmplay --lib-info | tee metadata/VGMPLAY_LIB_INFO.txt
+
+          if ! grep -Eiq 'C352' metadata/VGMPLAY_LIB_INFO.txt; then
+            echo "C352 support was not reported by VGMPlay."
+            exit 1
+          fi
+          echo "C352 support: PRESENT" | tee metadata/C352_SUPPORT_CHECK.txt
+
+          set +e
+          stage/bin/vgm2wav > metadata/VGM2WAV_USAGE.txt 2>&1
+          VGM2WAV_RC=$?
+          stage/bin/player > metadata/LIBVGM_PLAYER_USAGE.txt 2>&1
+          PLAYER_RC=$?
+          set -e
+
+          if ! grep -q 'Usage:' metadata/VGM2WAV_USAGE.txt; then
+            echo "vgm2wav usage smoke test failed."
+            cat metadata/VGM2WAV_USAGE.txt
+            exit 1
+          fi
+          printf 'vgm2wav no-input exit code: %s\n' "$VGM2WAV_RC" > metadata/VGM2WAV_SMOKE_TEST.txt
+          printf 'player no-input exit code: %s\n' "$PLAYER_RC" > metadata/LIBVGM_PLAYER_SMOKE_TEST.txt
+
+          for BIN in stage/bin/vgmplay stage/bin/vgm2wav stage/bin/player; do
+            NAME="$(basename "$BIN")"
+            file "$BIN" > "metadata/FILE_${NAME}.txt"
+            ldd "$BIN" > "metadata/LDD_${NAME}.txt"
+            if grep -q 'not found' "metadata/LDD_${NAME}.txt"; then
+              echo "Missing runtime dependency in $NAME"
+              cat "metadata/LDD_${NAME}.txt"
+              exit 1
+            fi
+            if grep -Eiq 'libasound|libpulse|libao|libdbus' "metadata/LDD_${NAME}.txt"; then
+              echo "Unexpected non-portable audio/media dependency in $NAME"
+              cat "metadata/LDD_${NAME}.txt"
+              exit 1
+            fi
+          done
+
+          if ! readelf -S stage/bin/vgmplay | grep -qE '\.debug_info|\.debug_line'; then
+            echo "VGMPlay debug information is missing."
+            exit 1
+          fi
+          if ! readelf -S stage/bin/vgm2wav | grep -qE '\.debug_info|\.debug_line'; then
+            echo "vgm2wav debug information is missing."
+            exit 1
+          fi
+          echo "RelWithDebInfo sections: PRESENT" > metadata/DEBUG_SECTIONS_CHECK.txt
+
+      - name: Assemble reproducible analysis bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUNDLE="VGMPlay_libvgm_integrated_linux_x86_64"
+          ARCHIVE="${BUNDLE}.tar.zst"
+          rm -rf "$BUNDLE" deliverables
+
+          mkdir -p \
+            "$BUNDLE/bin" \
+            "$BUNDLE/config" \
+            "$BUNDLE/sdk" \
+            "$BUNDLE/source/combined" \
+            "$BUNDLE/logs" \
+            "$BUNDLE/metadata" \
+            deliverables
+
+          for BIN in vgmplay vgm2wav player; do
+            cp "stage/bin/$BIN" "$BUNDLE/bin/${BIN}.relwithdebinfo"
+            cp "stage/bin/$BIN" "$BUNDLE/bin/${BIN}.stripped"
+            strip --strip-unneeded "$BUNDLE/bin/${BIN}.stripped"
+            chmod +x "$BUNDLE/bin/${BIN}.relwithdebinfo" "$BUNDLE/bin/${BIN}.stripped"
+          done
+
+          cp stage/bin/vgmplay.ini "$BUNDLE/config/" 2>/dev/null || true
+          cp stage/bin/vgmplay.txt "$BUNDLE/config/" 2>/dev/null || true
+          cp stage/bin/updates.txt "$BUNDLE/config/" 2>/dev/null || true
+
+          cp -a stage/include "$BUNDLE/sdk/" 2>/dev/null || true
+          cp -a stage/lib "$BUNDLE/sdk/" 2>/dev/null || true
+
+          rsync -a --exclude='.git' src/vgmplay/ "$BUNDLE/source/combined/vgmplay-with-libvgm/"
+
+          cp -a logs/. "$BUNDLE/logs/"
+          cp -a metadata/. "$BUNDLE/metadata/"
+
+          sha256sum \
+            "$BUNDLE/bin/vgmplay.relwithdebinfo" \
+            "$BUNDLE/bin/vgmplay.stripped" \
+            "$BUNDLE/bin/vgm2wav.relwithdebinfo" \
+            "$BUNDLE/bin/vgm2wav.stripped" \
+            "$BUNDLE/bin/player.relwithdebinfo" \
+            "$BUNDLE/bin/player.stripped" \
+            > "$BUNDLE/metadata/EXECUTABLE_SHA256SUMS.txt"
+
+          cat > "$BUNDLE/README.txt" <<'EOF'
+VGMPlay + libvgm integrated Linux x86_64 analysis bundle
+========================================================
+
+Pinned sources:
+- VGMPlay 0.52.0 commit 2a8f3909bcfca4c595ca71c0f762ff495a29e130
+- libvgm commit 9f376fbca88db3e9fd169a8b145b7d6932a020a9
+- inih and wingetopt use the commits recorded by the VGMPlay source tree.
+
+Included commands:
+- bin/vgmplay.stripped
+- bin/vgm2wav.stripped
+- bin/player.stripped
+
+The matching .relwithdebinfo executables retain source-level debug information.
+libvgm is linked statically. Only the Wave Writer output driver is enabled, so
+this bundle avoids ALSA, PulseAudio, libao and DBus runtime dependencies.
+
+C352 support is a mandatory build validation. See:
+- metadata/C352_SUPPORT_CHECK.txt
+- metadata/VGMPLAY_LIB_INFO.txt
+
+sdk/ contains installed libvgm headers, static libraries, pkg-config files and
+CMake package metadata for later dedicated converter development.
+
+source/combined/ contains the complete integrated source tree used by this build.
+EOF
+
+          (
+            cd "$BUNDLE"
+            find . -type f ! -name SHA256SUMS.txt -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS.txt
+          )
+
+          tar \
+            --sort=name \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -cf - "$BUNDLE" \
+            | zstd -T0 -10 -o "$ARCHIVE"
+
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          cp "$ARCHIVE" "${ARCHIVE}.sha256" deliverables/
+
+          cat > deliverables/UPLOAD.txt <<EOF
+Upload these files together:
+- ${ARCHIVE}
+- ${ARCHIVE}.sha256
+EOF
+
+          ls -lh deliverables/
+
+      - name: Upload integrated VGM analysis bundle
+        uses: actions/upload-artifact@v6
+        with:
+          name: VGMPlay-libvgm-Integrated-Linux-x86_64
+          path: deliverables/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
