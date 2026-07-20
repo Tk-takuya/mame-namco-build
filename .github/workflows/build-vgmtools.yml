@@ -1,0 +1,354 @@
+name: Build vgmtools analysis bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-vgmtools.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Linux x86_64 vgmtools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      VGMTOOLS_COMMIT: b7d86323fd841799a92436c8017c04b2eb9ed762
+
+    steps:
+      - name: Checkout pinned vgmtools source
+        uses: actions/checkout@v6
+        with:
+          repository: vgmrips/vgmtools
+          ref: ${{ env.VGMTOOLS_COMMIT }}
+          path: src/vgmtools
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            zlib1g-dev \
+            file \
+            binutils \
+            rsync \
+            zstd
+
+      - name: Record source and environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p metadata logs smoke
+
+          git -C src/vgmtools rev-parse HEAD \
+            | tee metadata/VGMTOOLS_COMMIT.txt
+          git -C src/vgmtools rev-parse HEAD^{tree} \
+            | tee metadata/VGMTOOLS_TREE_SHA.txt
+          git -C src/vgmtools log -1 --format=fuller \
+            > metadata/VGMTOOLS_COMMIT_DETAIL.txt
+
+          uname -a > metadata/UNAME.txt
+          cat /etc/os-release > metadata/OS_RELEASE.txt
+          gcc --version > metadata/GCC_VERSION.txt
+          g++ --version > metadata/GXX_VERSION.txt
+          cmake --version > metadata/CMAKE_VERSION.txt
+          ninja --version > metadata/NINJA_VERSION.txt
+
+          {
+            echo "vgmtools=${VGMTOOLS_COMMIT}"
+            echo "BuildType=RelWithDebInfo"
+            echo "Generator=Ninja"
+            echo "ZLIB=system"
+            echo "ExperimentalTargets=optdac,optvgm32"
+          } > metadata/BUILD_PARAMETERS.txt
+
+          grep -RIn \
+            --include='*.c' \
+            --include='*.h' \
+            --include='*.cpp' \
+            'C352' src/vgmtools \
+            | tee metadata/C352_SOURCE_REFERENCES.txt
+
+          test -s metadata/C352_SOURCE_REFERENCES.txt
+
+      - name: Configure and build all tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cmake \
+            -S src/vgmtools \
+            -B build/vgmtools \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX="$PWD/stage" \
+            2>&1 | tee logs/VGMTOOLS_CONFIGURE.log
+
+          cmake --build build/vgmtools --parallel 2 \
+            2>&1 | tee logs/VGMTOOLS_BUILD_DEFAULT.log
+
+          cmake --build build/vgmtools --parallel 2 \
+            --target optdac optvgm32 \
+            2>&1 | tee logs/VGMTOOLS_BUILD_EXPERIMENTAL.log
+
+          cmake --install build/vgmtools \
+            2>&1 | tee logs/VGMTOOLS_INSTALL.log
+
+      - name: Validate tools and C352 support
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUIRED_TOOLS=(
+            vgm2txt
+            vgm_cmp
+            vgm_cnt
+            vgm_stat
+            vgm_trim
+            vgm_sro
+            vgmlpfnd
+            vgm_ptch
+            vgm_tag
+            vgmmerge
+          )
+
+          for TOOL in "${REQUIRED_TOOLS[@]}"; do
+            test -x "stage/bin/${TOOL}"
+          done
+
+          find stage/bin \
+            -maxdepth 1 \
+            -type f \
+            -perm -u+x \
+            -printf '%f\n' \
+            | sort \
+            | tee metadata/BUILT_TOOL_LIST.txt
+
+          TOOL_COUNT="$(wc -l < metadata/BUILT_TOOL_LIST.txt)"
+          echo "Built executable count: ${TOOL_COUNT}" \
+            | tee metadata/BUILT_TOOL_COUNT.txt
+
+          if [ "$TOOL_COUNT" -lt 28 ]; then
+            echo "Unexpectedly small vgmtools executable set."
+            exit 1
+          fi
+
+          for BIN in stage/bin/*; do
+            test -x "$BIN" || continue
+            NAME="$(basename "$BIN")"
+            file "$BIN" > "metadata/FILE_${NAME}.txt"
+            ldd "$BIN" > "metadata/LDD_${NAME}.txt" 2>&1 || true
+            if grep -q 'not found' "metadata/LDD_${NAME}.txt"; then
+              echo "Missing runtime dependency in ${NAME}."
+              cat "metadata/LDD_${NAME}.txt"
+              exit 1
+            fi
+          done
+
+          readelf -S stage/bin/vgm2txt \
+            | grep -qE '\.debug_info|\.debug_line'
+          readelf -S stage/bin/vgm_cmp \
+            | grep -qE '\.debug_info|\.debug_line'
+
+          strings stage/bin/vgm2txt \
+            | grep -i 'C352' \
+            | tee metadata/C352_VGM2TXT_STRINGS.txt
+          strings stage/bin/vgm_cnt \
+            | grep -i 'C352' \
+            | tee metadata/C352_VGMCNT_STRINGS.txt
+
+          test -s metadata/C352_VGM2TXT_STRINGS.txt
+          test -s metadata/C352_VGMCNT_STRINGS.txt
+
+          echo "C352 support: PRESENT" \
+            > metadata/C352_SUPPORT_CHECK.txt
+          echo "RelWithDebInfo sections: PRESENT" \
+            > metadata/DEBUG_SECTIONS_CHECK.txt
+
+      - name: Run minimal VGM smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dd if=/dev/zero \
+            of=smoke/minimal.vgm \
+            bs=1 \
+            count=65 \
+            status=none
+
+          printf 'Vgm ' \
+            | dd of=smoke/minimal.vgm \
+                bs=1 seek=0 conv=notrunc status=none
+          printf '\x3d\x00\x00\x00' \
+            | dd of=smoke/minimal.vgm \
+                bs=1 seek=4 conv=notrunc status=none
+          printf '\x50\x01\x00\x00' \
+            | dd of=smoke/minimal.vgm \
+                bs=1 seek=8 conv=notrunc status=none
+          printf '\x0c\x00\x00\x00' \
+            | dd of=smoke/minimal.vgm \
+                bs=1 seek=52 conv=notrunc status=none
+          printf '\x66' \
+            | dd of=smoke/minimal.vgm \
+                bs=1 seek=64 conv=notrunc status=none
+
+          stage/bin/vgm2txt \
+            smoke/minimal.vgm \
+            0 \
+            0 \
+            smoke/minimal.txt \
+            > smoke/VGM2TXT_STDOUT.txt \
+            2> smoke/VGM2TXT_STDERR.txt
+
+          test -s smoke/minimal.txt
+          grep -Eiq 'VGM|End' smoke/minimal.txt
+
+          set +e
+          stage/bin/vgm_cnt smoke/minimal.vgm \
+            > smoke/VGMCNT_STDOUT.txt \
+            2> smoke/VGMCNT_STDERR.txt
+          VGMCNT_RC=$?
+          stage/bin/vgm_stat smoke/minimal.vgm \
+            > smoke/VGMSTAT_STDOUT.txt \
+            2> smoke/VGMSTAT_STDERR.txt
+          VGMSTAT_RC=$?
+          set -e
+
+          printf 'vgm2txt minimal VGM: PASS\n' \
+            > metadata/VGM2TXT_SMOKE_TEST.txt
+          printf 'vgm_cnt exit code: %s\n' "$VGMCNT_RC" \
+            > metadata/VGMCNT_SMOKE_TEST.txt
+          printf 'vgm_stat exit code: %s\n' "$VGMSTAT_RC" \
+            > metadata/VGMSTAT_SMOKE_TEST.txt
+
+      - name: Assemble reproducible vgmtools bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUNDLE="vgmtools_linux_x86_64_analysis_bundle"
+          ARCHIVE="${BUNDLE}.tar.zst"
+
+          rm -rf "$BUNDLE" deliverables
+          mkdir -p \
+            "$BUNDLE/bin/relwithdebinfo" \
+            "$BUNDLE/bin/stripped" \
+            "$BUNDLE/docs" \
+            "$BUNDLE/source" \
+            "$BUNDLE/logs" \
+            "$BUNDLE/metadata" \
+            "$BUNDLE/smoke-test" \
+            deliverables
+
+          while IFS= read -r TOOL; do
+            cp "stage/bin/${TOOL}" \
+              "$BUNDLE/bin/relwithdebinfo/${TOOL}"
+            cp "stage/bin/${TOOL}" \
+              "$BUNDLE/bin/stripped/${TOOL}"
+            strip --strip-unneeded \
+              "$BUNDLE/bin/stripped/${TOOL}"
+            chmod +x \
+              "$BUNDLE/bin/relwithdebinfo/${TOOL}" \
+              "$BUNDLE/bin/stripped/${TOOL}"
+          done < metadata/BUILT_TOOL_LIST.txt
+
+          cp src/vgmtools/README.md "$BUNDLE/docs/"
+          cp src/vgmtools/ReadMe.txt "$BUNDLE/docs/" 2>/dev/null || true
+
+          rsync -a \
+            --exclude='.git' \
+            src/vgmtools/ \
+            "$BUNDLE/source/vgmtools/"
+
+          cp -a logs/. "$BUNDLE/logs/"
+          cp -a metadata/. "$BUNDLE/metadata/"
+          cp -a smoke/. "$BUNDLE/smoke-test/"
+
+          (
+            cd "$BUNDLE/bin/relwithdebinfo"
+            sha256sum * \
+              > ../../metadata/RELWITHDEBINFO_SHA256SUMS.txt
+          )
+
+          (
+            cd "$BUNDLE/bin/stripped"
+            sha256sum * \
+              > ../../metadata/STRIPPED_SHA256SUMS.txt
+          )
+
+          {
+            echo "vgmtools Linux x86_64 analysis bundle"
+            echo "====================================="
+            echo
+            echo "Pinned source commit: ${VGMTOOLS_COMMIT}"
+            echo
+            echo "bin/relwithdebinfo/ retains debug information."
+            echo "bin/stripped/ contains smaller runtime copies."
+            echo "source/ contains the complete source snapshot."
+            echo "logs/ and metadata/ contain reproducibility evidence."
+            echo "smoke-test/ contains validation inputs and outputs."
+            echo
+            echo "Primary tools:"
+            echo "- vgm2txt: command stream text export"
+            echo "- vgm_cnt: command and note counting"
+            echo "- vgm_stat: VGM statistics"
+            echo "- vgm_cmp: redundant-command compression"
+            echo "- vgm_trim: trimming and loop-point application"
+            echo "- vgm_sro: sample-ROM optimization"
+            echo "- vgmlpfnd: loop search"
+            echo "- vgm_ptch: header and channel patching"
+            echo
+            echo "optdac and optvgm32 are experimental."
+          } > "$BUNDLE/README.txt"
+
+          (
+            cd "$BUNDLE"
+            find . \
+              -type f \
+              ! -name SHA256SUMS.txt \
+              -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS.txt
+          )
+
+          tar \
+            --sort=name \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -cf - "$BUNDLE" \
+            | zstd -T0 -10 -o "$ARCHIVE"
+
+          sha256sum "$ARCHIVE" \
+            > "${ARCHIVE}.sha256"
+
+          cp "$ARCHIVE" "${ARCHIVE}.sha256" deliverables/
+
+          {
+            echo "Upload these files together:"
+            echo "- ${ARCHIVE}"
+            echo "- ${ARCHIVE}.sha256"
+          } > deliverables/UPLOAD.txt
+
+          ls -lh deliverables/
+
+      - name: Upload vgmtools analysis bundle
+        uses: actions/upload-artifact@v6
+        with:
+          name: vgmtools-Linux-x86_64-Analysis-Bundle
+          path: deliverables/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
