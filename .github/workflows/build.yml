@@ -2,6 +2,11 @@ name: Build MAME Namco System 11-12
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build.yml"
 
 permissions:
   contents: read
