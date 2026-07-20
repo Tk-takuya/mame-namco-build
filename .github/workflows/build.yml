@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Linux x86_64
+    name: Build Qt-free Linux x86_64
     runs-on: ubuntu-24.04
     timeout-minutes: 180
 
@@ -30,6 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
@@ -43,20 +44,31 @@ jobs:
             libxinerama-dev \
             libudev-dev \
             libgl1-mesa-dev \
-            qt6-base-dev \
-            qt6-base-dev-tools \
             file \
             binutils \
             zstd
 
-      - name: Build focused MAME debug binary
+      - name: Build focused Qt-free MAME debug binary
         shell: bash
         run: |
           set -euo pipefail
           cd mame
 
           git rev-parse HEAD > ../MAME_COMMIT.txt
+          git rev-parse HEAD^{tree} > ../MAME_TREE_SHA.txt
           git log -1 --format=fuller > ../MAME_COMMIT_DETAIL.txt
+
+          {
+            echo "SUBTARGET=namcoquattro"
+            echo "SOURCES=src/mame/namco/namcos11.cpp,src/mame/namco/namcos12.cpp"
+            echo "DEBUG=1"
+            echo "SYMBOLS=1"
+            echo "SYMLEVEL=1"
+            echo "OPTIMIZE=1"
+            echo "USE_QTDEBUG=0"
+            echo "NOWERROR=1"
+            echo "REGENIE=1"
+          } > ../BUILD_PARAMETERS.txt
 
           make \
             -j2 \
@@ -68,6 +80,7 @@ jobs:
             SYMBOLS=1 \
             SYMLEVEL=1 \
             OPTIMIZE=1 \
+            USE_QTDEBUG=0 \
             2>&1 | tee ../BUILD.log
 
           echo "Searching the complete build tree for the linked executable..."
@@ -103,20 +116,42 @@ jobs:
           echo "$BINARY" > ../BINARY_PATH.txt
 
           chmod +x "$BINARY"
-          cp "$BINARY" ../mame-namcoquattro.debug
-          cp "$BINARY" ../mame-namcoquattro.debug.stripped
-          strip --strip-unneeded ../mame-namcoquattro.debug.stripped || true
-          chmod +x ../mame-namcoquattro.debug ../mame-namcoquattro.debug.stripped
 
-      - name: Test binary and supported games
+          ldd "$BINARY" | tee ../LDD_ORIGINAL.txt
+
+          if grep -Eiq 'libQt[0-9]*' ../LDD_ORIGINAL.txt; then
+            echo "Qt dependency is still present."
+            exit 1
+          fi
+
+          cp "$BINARY" ../mame-namcoquattro.qtfree.debug
+          cp "$BINARY" ../mame-namcoquattro.qtfree.debug.stripped
+
+          strip --strip-unneeded ../mame-namcoquattro.qtfree.debug.stripped || true
+
+          chmod +x \
+            ../mame-namcoquattro.qtfree.debug \
+            ../mame-namcoquattro.qtfree.debug.stripped
+
+      - name: Test Qt-free binary and supported games
         shell: bash
         run: |
           set -euo pipefail
+
           export SDL_VIDEODRIVER=dummy
           export SDL_AUDIODRIVER=dummy
 
-          ./mame-namcoquattro.debug.stripped -version | tee MAME_VERSION.txt
-          ./mame-namcoquattro.debug.stripped -listfull > SUPPORTED_SYSTEMS.txt
+          ./mame-namcoquattro.qtfree.debug.stripped \
+            -version \
+            | tee MAME_VERSION.txt
+
+          ./mame-namcoquattro.qtfree.debug.stripped \
+            -help \
+            > MAME_HELP.txt
+
+          ./mame-namcoquattro.qtfree.debug.stripped \
+            -listfull \
+            > SUPPORTED_SYSTEMS.txt
 
           for system in tekken tekken2 souledge soulclbr ehrgeiz; do
             if grep -Eq "^${system}[[:space:]]" SUPPORTED_SYSTEMS.txt; then
@@ -127,13 +162,40 @@ jobs:
             fi
           done | tee REQUIRED_SYSTEMS_CHECK.txt
 
-          file mame-namcoquattro.debug > FILE_INFO_DEBUG.txt
-          file mame-namcoquattro.debug.stripped > FILE_INFO_STRIPPED.txt
-          ldd mame-namcoquattro.debug > LDD_DEBUG.txt
-          ldd mame-namcoquattro.debug.stripped > LDD_STRIPPED.txt
+          file \
+            mame-namcoquattro.qtfree.debug \
+            > FILE_INFO_DEBUG.txt
+
+          file \
+            mame-namcoquattro.qtfree.debug.stripped \
+            > FILE_INFO_STRIPPED.txt
+
+          ldd \
+            mame-namcoquattro.qtfree.debug \
+            > LDD_DEBUG.txt
+
+          ldd \
+            mame-namcoquattro.qtfree.debug.stripped \
+            > LDD_STRIPPED.txt
+
+          if grep -Eiq 'libQt[0-9]*' LDD_DEBUG.txt LDD_STRIPPED.txt; then
+            echo "Qt dependency detected after packaging copy."
+            exit 1
+          fi
+
+          if ! readelf -S mame-namcoquattro.qtfree.debug \
+            | grep -qE '\.debug_info|\.debug_line'; then
+            echo "Debug information is missing."
+            exit 1
+          fi
+
+          echo "Qt dependency: ABSENT" > QT_DEPENDENCY_CHECK.txt
+          echo "CLI version test: PASS" > CLI_SMOKE_TEST.txt
+          echo "Debug sections: PRESENT" > DEBUG_SECTIONS_CHECK.txt
+
           sha256sum \
-            mame-namcoquattro.debug \
-            mame-namcoquattro.debug.stripped \
+            mame-namcoquattro.qtfree.debug \
+            mame-namcoquattro.qtfree.debug.stripped \
             > EXECUTABLE_SHA256SUMS.txt
 
       - name: Assemble and split bundle
@@ -141,13 +203,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          BUNDLE="MAME_namco_system11_12_linux_x86_64_bundle"
+          BUNDLE="MAME_namco_system11_12_qtfree_linux_x86_64_bundle"
           ARCHIVE="${BUNDLE}.tar.zst"
 
           rm -rf "$BUNDLE" deliverables
+
           mkdir -p \
             "$BUNDLE/bin" \
             "$BUNDLE/run/roms" \
+            "$BUNDLE/run/cfg" \
+            "$BUNDLE/run/nvram" \
+            "$BUNDLE/run/diff" \
             "$BUNDLE/source-focused/src/mame/namco" \
             "$BUNDLE/source-focused/src/devices/sound" \
             "$BUNDLE/source-focused/src/devices/cpu" \
@@ -156,85 +222,175 @@ jobs:
             "$BUNDLE/metadata" \
             deliverables
 
-          cp mame-namcoquattro.debug "$BUNDLE/bin/"
-          cp mame-namcoquattro.debug.stripped "$BUNDLE/bin/"
-          cp mame-namcoquattro.debug.stripped "$BUNDLE/run/mame-namcoquattro"
-          chmod +x "$BUNDLE/bin/"* "$BUNDLE/run/mame-namcoquattro"
-          touch "$BUNDLE/run/roms/.keep"
+          cp \
+            mame-namcoquattro.qtfree.debug \
+            "$BUNDLE/bin/"
 
-          cp mame/src/mame/namco/namcos11.cpp "$BUNDLE/source-focused/src/mame/namco/"
-          cp mame/src/mame/namco/namcos12.cpp "$BUNDLE/source-focused/src/mame/namco/"
-          cp mame/src/devices/sound/c352.cpp "$BUNDLE/source-focused/src/devices/sound/"
-          cp mame/src/devices/sound/c352.h "$BUNDLE/source-focused/src/devices/sound/"
-          cp -a mame/src/devices/cpu/h8 "$BUNDLE/source-focused/src/devices/cpu/"
+          cp \
+            mame-namcoquattro.qtfree.debug.stripped \
+            "$BUNDLE/bin/"
+
+          cp \
+            mame-namcoquattro.qtfree.debug.stripped \
+            "$BUNDLE/run/mame-namcoquattro"
+
+          chmod +x \
+            "$BUNDLE/bin/"* \
+            "$BUNDLE/run/mame-namcoquattro"
+
+          touch "$BUNDLE/run/roms/.keep"
+          touch "$BUNDLE/run/cfg/.keep"
+          touch "$BUNDLE/run/nvram/.keep"
+          touch "$BUNDLE/run/diff/.keep"
+
+          cp \
+            mame/src/mame/namco/namcos11.cpp \
+            "$BUNDLE/source-focused/src/mame/namco/"
+
+          cp \
+            mame/src/mame/namco/namcos12.cpp \
+            "$BUNDLE/source-focused/src/mame/namco/"
+
+          cp \
+            mame/src/devices/sound/c352.cpp \
+            mame/src/devices/sound/c352.h \
+            "$BUNDLE/source-focused/src/devices/sound/"
+
+          cp -a \
+            mame/src/devices/cpu/h8 \
+            "$BUNDLE/source-focused/src/devices/cpu/"
+
+          cp \
+            mame/makefile \
+            "$BUNDLE/source-focused/"
 
           MAME_COMMIT="$(cat MAME_COMMIT.txt)"
+
           (
             cd mame
             git archive --format=tar HEAD
-          ) | zstd -T0 -10 -o "$BUNDLE/source-full/MAME_source_${MAME_COMMIT}.tar.zst"
+          ) | zstd \
+                -T0 \
+                -10 \
+                -o "$BUNDLE/source-full/MAME_source_${MAME_COMMIT}.tar.zst"
 
-          cp BUILD.log SUPPORTED_SYSTEMS.txt REQUIRED_SYSTEMS_CHECK.txt "$BUNDLE/logs/"
+          cp \
+            BUILD.log \
+            SUPPORTED_SYSTEMS.txt \
+            REQUIRED_SYSTEMS_CHECK.txt \
+            MAME_HELP.txt \
+            "$BUNDLE/logs/"
+
           cp \
             MAME_COMMIT.txt \
+            MAME_TREE_SHA.txt \
             MAME_COMMIT_DETAIL.txt \
+            BUILD_PARAMETERS.txt \
             BINARY_CANDIDATES.txt \
             BINARY_PATH.txt \
             MAME_VERSION.txt \
             FILE_INFO_DEBUG.txt \
             FILE_INFO_STRIPPED.txt \
+            LDD_ORIGINAL.txt \
             LDD_DEBUG.txt \
             LDD_STRIPPED.txt \
+            QT_DEPENDENCY_CHECK.txt \
+            CLI_SMOKE_TEST.txt \
+            DEBUG_SECTIONS_CHECK.txt \
             EXECUTABLE_SHA256SUMS.txt \
             "$BUNDLE/metadata/"
 
           cat > "$BUNDLE/README.txt" <<'EOF'
-          MAME Namco System 11/12 Linux x86_64 bundle
+          MAME Namco System 11/12 Qt-free Linux x86_64 bundle
+          ===================================================
 
           This bundle contains a focused MAME debug build for:
+
           - Tekken
           - Tekken 2
           - Soul Edge
           - Soulcalibur
           - Ehrgeiz
 
-          ROM files are not included.
-          Place MAME ROM ZIP files in run/roms/.
+          The build uses USE_QTDEBUG=0. It does not link to Qt libraries.
 
-          bin/mame-namcoquattro.debug
-            Debug executable with symbols.
+          ROM files are not included. Place MAME ROM ZIP files in run/roms/.
 
-          bin/mame-namcoquattro.debug.stripped
-            Smaller copy of the same debug build with ELF symbols stripped.
+          bin/mame-namcoquattro.qtfree.debug
+            Debug executable with source-level debug information.
+
+          bin/mame-namcoquattro.qtfree.debug.stripped
+            Smaller executable for normal command-line runtime use.
+
+          run/mame-namcoquattro
+            Runnable copy of the stripped Qt-free executable.
 
           source-focused/
             System 11, System 12, C352 and H8 source files.
 
           source-full/
             Complete official MAME source snapshot for the recorded commit.
+
+          metadata/QT_DEPENDENCY_CHECK.txt
+            Must state that Qt dependencies are absent.
+
+          metadata/CLI_SMOKE_TEST.txt
+            Records successful command-line startup.
           EOF
 
           (
             cd "$BUNDLE"
-            find . -type f ! -name SHA256SUMS.txt -print0 \
+
+            find . \
+              -type f \
+              ! -name SHA256SUMS.txt \
+              -print0 \
               | sort -z \
               | xargs -0 sha256sum \
               > SHA256SUMS.txt
           )
 
-          tar --sort=name --owner=0 --group=0 --numeric-owner -cf - "$BUNDLE" \
-            | zstd -T0 -10 -o "$ARCHIVE"
+          tar \
+            --sort=name \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -cf - \
+            "$BUNDLE" \
+            | zstd \
+                -T0 \
+                -10 \
+                -o "$ARCHIVE"
 
-          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
-          split -b 85M -d -a 3 "$ARCHIVE" "deliverables/${ARCHIVE}.part-"
-          cp "${ARCHIVE}.sha256" deliverables/
+          sha256sum \
+            "$ARCHIVE" \
+            > "${ARCHIVE}.sha256"
+
+          split \
+            -b 85M \
+            -d \
+            -a 3 \
+            "$ARCHIVE" \
+            "deliverables/${ARCHIVE}.part-"
+
+          cp \
+            "${ARCHIVE}.sha256" \
+            deliverables/
 
           (
             cd deliverables
             sha256sum "${ARCHIVE}.part-"* > PARTS_SHA256SUMS.txt
           )
 
-          PART_LIST="$(find deliverables -maxdepth 1 -type f -name "${ARCHIVE}.part-*" -printf '%f\n' | sort | paste -sd+ -)"
+          PART_LIST="$(
+            find deliverables \
+              -maxdepth 1 \
+              -type f \
+              -name "${ARCHIVE}.part-*" \
+              -printf '%f\n' \
+              | sort \
+              | paste -sd+ -
+          )"
 
           cat > deliverables/REASSEMBLE_WINDOWS.cmd <<EOF
           @echo off
@@ -253,10 +409,10 @@ jobs:
 
           ls -lh deliverables/
 
-      - name: Upload bundle parts
+      - name: Upload Qt-free bundle parts
         uses: actions/upload-artifact@v6
         with:
-          name: MAME-Namco-System11-12-Linux-x86_64
+          name: MAME-Namco-System11-12-QtFree-Linux-x86_64
           path: deliverables/
           if-no-files-found: error
           compression-level: 0
