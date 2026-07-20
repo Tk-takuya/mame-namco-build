@@ -1,0 +1,231 @@
+name: Build MAME Namco System 11-12
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout official MAME source
+        uses: actions/checkout@v6
+        with:
+          repository: mamedev/mame
+          path: mame
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            python3 \
+            libsdl2-dev \
+            libsdl2-ttf-dev \
+            libfontconfig1-dev \
+            libpulse-dev \
+            libasound2-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libudev-dev \
+            libgl1-mesa-dev \
+            qt6-base-dev \
+            qt6-base-dev-tools \
+            file \
+            binutils \
+            zstd
+
+      - name: Build focused MAME debug binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd mame
+
+          git rev-parse HEAD > ../MAME_COMMIT.txt
+          git log -1 --format=fuller > ../MAME_COMMIT_DETAIL.txt
+
+          make \
+            -j2 \
+            SUBTARGET=namcoquattro \
+            SOURCES="src/mame/namco/namcos11.cpp,src/mame/namco/namcos12.cpp" \
+            REGENIE=1 \
+            NOWERROR=1 \
+            DEBUG=1 \
+            SYMBOLS=1 \
+            SYMLEVEL=1 \
+            OPTIMIZE=1 \
+            2>&1 | tee ../BUILD.log
+
+          BINARY="$(find . -maxdepth 3 -type f -perm -u+x \( -name namcoquattro -o -name mame \) -print -quit)"
+          if [ -z "$BINARY" ]; then
+            echo "MAME executable was not found."
+            exit 1
+          fi
+
+          echo "$BINARY" > ../BINARY_PATH.txt
+          cp "$BINARY" ../mame-namcoquattro.debug
+          cp "$BINARY" ../mame-namcoquattro.debug.stripped
+          strip --strip-unneeded ../mame-namcoquattro.debug.stripped || true
+          chmod +x ../mame-namcoquattro.debug ../mame-namcoquattro.debug.stripped
+
+      - name: Test binary and supported games
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SDL_VIDEODRIVER=dummy
+          export SDL_AUDIODRIVER=dummy
+
+          ./mame-namcoquattro.debug.stripped -version | tee MAME_VERSION.txt
+          ./mame-namcoquattro.debug.stripped -listfull > SUPPORTED_SYSTEMS.txt
+
+          for system in tekken tekken2 souledge soulclbr ehrgeiz; do
+            if grep -Eq "^${system}[[:space:]]" SUPPORTED_SYSTEMS.txt; then
+              echo "${system}: PRESENT"
+            else
+              echo "${system}: MISSING"
+              exit 1
+            fi
+          done | tee REQUIRED_SYSTEMS_CHECK.txt
+
+          file mame-namcoquattro.debug > FILE_INFO_DEBUG.txt
+          file mame-namcoquattro.debug.stripped > FILE_INFO_STRIPPED.txt
+          ldd mame-namcoquattro.debug > LDD_DEBUG.txt
+          ldd mame-namcoquattro.debug.stripped > LDD_STRIPPED.txt
+          sha256sum \
+            mame-namcoquattro.debug \
+            mame-namcoquattro.debug.stripped \
+            > EXECUTABLE_SHA256SUMS.txt
+
+      - name: Assemble and split bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUNDLE="MAME_namco_system11_12_linux_x86_64_bundle"
+          ARCHIVE="${BUNDLE}.tar.zst"
+
+          rm -rf "$BUNDLE" deliverables
+          mkdir -p \
+            "$BUNDLE/bin" \
+            "$BUNDLE/run/roms" \
+            "$BUNDLE/source-focused/src/mame/namco" \
+            "$BUNDLE/source-focused/src/devices/sound" \
+            "$BUNDLE/source-focused/src/devices/cpu" \
+            "$BUNDLE/source-full" \
+            "$BUNDLE/logs" \
+            "$BUNDLE/metadata" \
+            deliverables
+
+          cp mame-namcoquattro.debug "$BUNDLE/bin/"
+          cp mame-namcoquattro.debug.stripped "$BUNDLE/bin/"
+          cp mame-namcoquattro.debug.stripped "$BUNDLE/run/mame-namcoquattro"
+          chmod +x "$BUNDLE/bin/"* "$BUNDLE/run/mame-namcoquattro"
+          touch "$BUNDLE/run/roms/.keep"
+
+          cp mame/src/mame/namco/namcos11.cpp "$BUNDLE/source-focused/src/mame/namco/"
+          cp mame/src/mame/namco/namcos12.cpp "$BUNDLE/source-focused/src/mame/namco/"
+          cp mame/src/devices/sound/c352.cpp "$BUNDLE/source-focused/src/devices/sound/"
+          cp mame/src/devices/sound/c352.h "$BUNDLE/source-focused/src/devices/sound/"
+          cp -a mame/src/devices/cpu/h8 "$BUNDLE/source-focused/src/devices/cpu/"
+
+          MAME_COMMIT="$(cat MAME_COMMIT.txt)"
+          (
+            cd mame
+            git archive --format=tar HEAD
+          ) | zstd -T0 -10 -o "$BUNDLE/source-full/MAME_source_${MAME_COMMIT}.tar.zst"
+
+          cp BUILD.log SUPPORTED_SYSTEMS.txt REQUIRED_SYSTEMS_CHECK.txt "$BUNDLE/logs/"
+          cp \
+            MAME_COMMIT.txt \
+            MAME_COMMIT_DETAIL.txt \
+            BINARY_PATH.txt \
+            MAME_VERSION.txt \
+            FILE_INFO_DEBUG.txt \
+            FILE_INFO_STRIPPED.txt \
+            LDD_DEBUG.txt \
+            LDD_STRIPPED.txt \
+            EXECUTABLE_SHA256SUMS.txt \
+            "$BUNDLE/metadata/"
+
+          cat > "$BUNDLE/README.txt" <<'EOF'
+          MAME Namco System 11/12 Linux x86_64 bundle
+
+          This bundle contains a focused MAME debug build for:
+          - Tekken
+          - Tekken 2
+          - Soul Edge
+          - Soulcalibur
+          - Ehrgeiz
+
+          ROM files are not included.
+          Place MAME ROM ZIP files in run/roms/.
+
+          bin/mame-namcoquattro.debug
+            Debug executable with symbols.
+
+          bin/mame-namcoquattro.debug.stripped
+            Smaller copy of the same debug build with ELF symbols stripped.
+
+          source-focused/
+            System 11, System 12, C352 and H8 source files.
+
+          source-full/
+            Complete official MAME source snapshot for the recorded commit.
+          EOF
+
+          (
+            cd "$BUNDLE"
+            find . -type f ! -name SHA256SUMS.txt -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS.txt
+          )
+
+          tar --sort=name --owner=0 --group=0 --numeric-owner -cf - "$BUNDLE" \
+            | zstd -T0 -10 -o "$ARCHIVE"
+
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          split -b 85M -d -a 3 "$ARCHIVE" "deliverables/${ARCHIVE}.part-"
+          cp "${ARCHIVE}.sha256" deliverables/
+
+          (
+            cd deliverables
+            sha256sum "${ARCHIVE}.part-"* > PARTS_SHA256SUMS.txt
+          )
+
+          PART_LIST="$(find deliverables -maxdepth 1 -type f -name "${ARCHIVE}.part-*" -printf '%f\n' | sort | paste -sd+ -)"
+
+          cat > deliverables/REASSEMBLE_WINDOWS.cmd <<EOF
+          @echo off
+          copy /b ${PART_LIST} ${ARCHIVE}
+          certutil -hashfile ${ARCHIVE} SHA256
+          type ${ARCHIVE}.sha256
+          pause
+          EOF
+
+          cat > deliverables/UPLOAD.txt <<EOF
+          Upload every .part-* file together with:
+          - ${ARCHIVE}.sha256
+          - PARTS_SHA256SUMS.txt
+          Do not rename the part files.
+          EOF
+
+          ls -lh deliverables/
+
+      - name: Upload bundle parts
+        uses: actions/upload-artifact@v6
+        with:
+          name: MAME-Namco-System11-12-Linux-x86_64
+          path: deliverables/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
