@@ -1,0 +1,154 @@
+name: Build MAME Runtime Support
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-runtime-support.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package SDL2_ttf runtime library
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Install runtime library
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            libsdl2-ttf-2.0-0 \
+            file \
+            binutils
+
+      - name: Create runtime support bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUNDLE="MAME_namco_runtime_support_linux_x86_64"
+          rm -rf "$BUNDLE"
+
+          mkdir -p \
+            "$BUNDLE/lib" \
+            "$BUNDLE/licenses"
+
+          SDL_TTF_PATH="$(
+            ldconfig -p \
+              | awk '/libSDL2_ttf-2.0.so.0/{print $NF; exit}'
+          )"
+
+          if [ -z "$SDL_TTF_PATH" ] || [ ! -f "$SDL_TTF_PATH" ]; then
+            echo "libSDL2_ttf-2.0.so.0 was not found."
+            exit 1
+          fi
+
+          cp -L \
+            "$SDL_TTF_PATH" \
+            "$BUNDLE/lib/libSDL2_ttf-2.0.so.0"
+
+          if [ -f /usr/share/doc/libsdl2-ttf-2.0-0/copyright ]; then
+            cp \
+              /usr/share/doc/libsdl2-ttf-2.0-0/copyright \
+              "$BUNDLE/licenses/SDL2_ttf_copyright.txt"
+          fi
+
+          cat > "$BUNDLE/run-mame-with-bundled-lib.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+          if [ "$#" -lt 1 ]; then
+            echo "Usage: $0 /path/to/mame-namcoquattro [MAME arguments...]"
+            exit 2
+          fi
+
+          MAME_BINARY="$1"
+          shift
+
+          export LD_LIBRARY_PATH="$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+          exec "$MAME_BINARY" "$@"
+          EOF
+
+          chmod +x "$BUNDLE/run-mame-with-bundled-lib.sh"
+
+          cat > "$BUNDLE/README.txt" <<'EOF'
+          MAME Namco Runtime Support - Linux x86_64
+          =========================================
+
+          Purpose
+          -------
+
+          This supplemental package provides libSDL2_ttf-2.0.so.0 for the
+          Qt-free MAME Namco System 11/12 build.
+
+          It is required only on Linux environments where that shared library
+          is not already installed.
+
+          Usage
+          -----
+
+          ./run-mame-with-bundled-lib.sh \
+            /path/to/mame-namcoquattro \
+            -version
+
+          The launcher prepends this bundle's lib directory to LD_LIBRARY_PATH
+          and then starts the supplied MAME executable.
+
+          The MAME executable itself is not included in this small supplemental
+          package. Use it together with the previously generated Qt-free MAME
+          artifact.
+          EOF
+
+          {
+            echo "=== LIBRARY SOURCE PATH ==="
+            echo "$SDL_TTF_PATH"
+            echo
+            echo "=== FILE INFO ==="
+            file "$BUNDLE/lib/libSDL2_ttf-2.0.so.0"
+            echo
+            echo "=== DEPENDENCIES ==="
+            ldd "$BUNDLE/lib/libSDL2_ttf-2.0.so.0"
+            echo
+            echo "=== PACKAGE VERSION ==="
+            dpkg-query -W -f='${Package} ${Version}\n' libsdl2-ttf-2.0-0
+          } > "$BUNDLE/BUILD_INFO.txt"
+
+          sha256sum \
+            "$BUNDLE/lib/libSDL2_ttf-2.0.so.0" \
+            > "$BUNDLE/LIBRARY_SHA256.txt"
+
+          (
+            cd "$BUNDLE"
+            find . \
+              -type f \
+              ! -name SHA256SUMS.txt \
+              -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              > SHA256SUMS.txt
+          )
+
+          zip -r "${BUNDLE}.zip" "$BUNDLE"
+          sha256sum "${BUNDLE}.zip" > "${BUNDLE}.zip.sha256"
+
+      - name: Upload runtime support bundle
+        uses: actions/upload-artifact@v6
+        with:
+          name: MAME-Namco-Runtime-Support-Linux-x86_64
+          path: |
+            MAME_namco_runtime_support_linux_x86_64.zip
+            MAME_namco_runtime_support_linux_x86_64.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
